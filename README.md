@@ -6,9 +6,9 @@ The local and AWS workflows have both been tested with real STEP models. See [va
 
 ## Architecture
 
-[![AWS architecture showing browser requests, direct S3 file transfers, Batch conversion, and state recovery](docs/architecture.png)](docs/architecture.png)
+[![AWS reference architecture showing application access, job dispatch, Batch compute, storage, and recovery](docs/architecture.png)](docs/architecture.png)
 
-Amazon ECR stores the runtime images. CloudWatch collects service logs and raises operational alarms. See [architecture details](docs/architecture.md) for the service boundaries and the local development path.
+This is the reference design. The current deployment uses a single CPU Batch compute environment. High-memory, MPI, and hybrid compute are future extensions. See [architecture details](docs/architecture.md) for the deployed workflow.
 
 ## Run a real conversion
 
