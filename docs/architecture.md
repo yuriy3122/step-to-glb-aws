@@ -1,6 +1,6 @@
 # Architecture
 
-See the [architecture diagram in the README](../README.md#architecture).
+See the [architecture diagram in the README](../README.md#architecture) and its [Mermaid source](architecture.mmd).
 
 The API and placement scheduler are separate Fargate services. The conversion worker uses an EC2-compatible Batch job definition and never runs on Fargate. Lambda functions handle stream dispatch and state/recovery only. AWS Batch owns EC2 selection/provisioning; the placement abstraction chooses the configured CPU queue. GPU, MPI, high-memory and hybrid capacity are not provisioned.
 

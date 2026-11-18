@@ -1,0 +1,25 @@
+flowchart TB
+    Browser["Browser<br/>React + Babylon.js"] <-->|"Sign-in · PKCE"| Cognito["Cognito"]
+    Browser -->|"HTTPS · ID token"| Gateway["API Gateway"]
+    Browser <-->|"Presigned transfers"| S3[("Private S3<br/>STEP · GLB · manifests")]
+    Gateway --> Link["VPC Link"]
+    Link --> ALB["Internal ALB"]
+    ALB --> API["Job API · ECS Fargate<br/>React hosting · signed URLs"]
+    API --> DDB[("DynamoDB<br/>Job and attempt state")]
+    DDB -->|"DynamoDB Streams"| Dispatch["Dispatch Lambda"]
+    Dispatch --> SQS["SQS dispatch + DLQ"]
+    SQS --> Scheduler["Scheduler · ECS Fargate"]
+    Scheduler --> Batch["AWS Batch · CPU queue"]
+    Batch --> Worker["EC2 worker · scales to zero<br/>.NET host + OCCT converter"]
+    Worker -->|"GLB + manifest"| S3
+    Worker -. "Stage progress" .-> DDB
+    Batch --> Events["EventBridge state events"]
+    Events --> Recovery["State and Recovery Lambda"]
+    Timer["EventBridge Scheduler"] --> Recovery
+    Recovery -. "Verify output and checksum" .-> S3
+    Recovery -. "Confirm state" .-> DDB
+
+    classDef storage fill:#e9f7ef,stroke:#74a68b,color:#142438
+    classDef events fill:#f4effc,stroke:#a29bc5,color:#142438
+    class S3,DDB storage
+    class Dispatch,SQS,Events,Timer,Recovery events

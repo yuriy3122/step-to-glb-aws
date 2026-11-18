@@ -6,38 +6,9 @@ The local and AWS workflows have both been tested with real STEP models. See [va
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    Browser["Browser · React and Babylon.js"] -->|"HTTPS and Cognito ID token"| Gateway["API Gateway HTTP API"]
-    Cognito["Amazon Cognito · Authorization code + PKCE"] --> Browser
-    Gateway --> Link["VPC Link"]
-    Link --> ALB["Internal Application Load Balancer"]
-    ALB --> API["ECS Fargate · .NET Job API and React hosting"]
-    API --> DDB[("DynamoDB · Jobs and attempts")]
-    API -->|"Short-lived presigned URLs"| Browser
-    Browser <-->|"Direct STEP upload and GLB download"| S3[("Private S3 · Inputs, results and manifests")]
-    DDB --> Streams["DynamoDB Streams"]
-    Streams --> Dispatch["Dispatch Lambda"]
-    Dispatch --> SQS["SQS dispatch queue and DLQ"]
-    SQS --> Scheduler["ECS Fargate · Placement Scheduler"]
-    Scheduler --> Batch["AWS Batch · CPU job queue"]
-    Batch --> EC2["Managed EC2 · Scales to zero"]
-    EC2 --> Worker[".NET Worker Host"]
-    Worker --> Converter["C++20 and OpenCascade · STEP to GLB"]
-    Converter -->|"Stage progress"| Worker
-    Worker --> DDB
-    Worker <--> S3
-    Batch --> Events["EventBridge · Batch state events"]
-    Events --> Recovery["State and Recovery Lambda"]
-    Schedule["EventBridge Scheduler"] --> Recovery
-    Recovery -->|"Verify output and checksum"| S3
-    Recovery -->|"Reconcile provider state"| Batch
-    Recovery --> DDB
-    ECR["Amazon ECR · Runtime images"] --> API & Scheduler & Worker
-    API & Scheduler & Dispatch & Recovery & Worker --> Logs["CloudWatch · Logs and alarms"]
-```
+[![AWS architecture showing browser requests, direct S3 file transfers, Batch conversion, and state recovery](docs/architecture.png)](docs/architecture.png)
 
-See [architecture details](docs/architecture.md) for the service boundaries and the local development path.
+Amazon ECR stores the runtime images. CloudWatch collects service logs and raises operational alarms. See [architecture details](docs/architecture.md) for the service boundaries and the local development path.
 
 ## Run a real conversion
 
