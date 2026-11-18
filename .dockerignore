@@ -1,0 +1,8 @@
+.local
+.git
+**/node_modules
+**/bin
+**/obj
+build
+artifacts
+src/frontend/dist

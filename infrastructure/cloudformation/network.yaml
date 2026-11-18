@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Two-AZ private compute network with one NAT gateway and S3/DynamoDB gateway endpoints
+Parameters:
+  EnvironmentName: {Type: String, Default: cad-demo}
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Ref EnvironmentName}]
+  InternetGateway: {Type: 'AWS::EC2::InternetGateway'}
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+  PublicA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.42.0.0/24, AvailabilityZone: !Select [0, !GetAZs '']}
+  PublicB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.42.1.0/24, AvailabilityZone: !Select [1, !GetAZs '']}
+  PrivateA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.42.10.0/24, AvailabilityZone: !Select [0, !GetAZs '']}
+  PrivateB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.42.11.0/24, AvailabilityZone: !Select [1, !GetAZs '']}
+  PublicRoutes:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: {RouteTableId: !Ref PublicRoutes, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  PublicAAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicA, RouteTableId: !Ref PublicRoutes}
+  PublicBAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicB, RouteTableId: !Ref PublicRoutes}
+  NatAddress:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties: {Domain: vpc}
+  Nat:
+    Type: AWS::EC2::NatGateway
+    DependsOn: PublicRoute
+    Properties: {AllocationId: !GetAtt NatAddress.AllocationId, SubnetId: !Ref PublicA}
+  PrivateRoutes:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivateRoutes, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref Nat}
+  PrivateAAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateA, RouteTableId: !Ref PrivateRoutes}
+  PrivateBAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateB, RouteTableId: !Ref PrivateRoutes}
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties: {VpcId: !Ref Vpc, ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3', VpcEndpointType: Gateway, RouteTableIds: [!Ref PrivateRoutes]}
+  DynamoEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties: {VpcId: !Ref Vpc, ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb', VpcEndpointType: Gateway, RouteTableIds: [!Ref PrivateRoutes]}
+Outputs:
+  VpcId: {Value: !Ref Vpc}
+  PrivateSubnetIds: {Value: !Join [',', [!Ref PrivateA, !Ref PrivateB]]}

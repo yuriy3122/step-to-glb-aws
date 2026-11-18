@@ -1,0 +1,28 @@
+{
+  "name": "step-glb-platform",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "test:glb": "node ../../tests/frontend/validate-glb.mjs"
+  },
+  "dependencies": {
+    "@babylonjs/core": "9.0.0",
+    "@babylonjs/loaders": "9.0.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "@vitejs/plugin-react": "6.3.0",
+    "gltf-validator": "2.0.0-dev.3.10",
+    "typescript": "5.9.3",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  }
+}

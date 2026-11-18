@@ -1,0 +1,680 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Multi-tenant STEP-to-GLB API on Fargate, SQS scheduler, Batch EC2 workers, recovery and a same-origin React frontend
+Parameters:
+  EnvironmentName: {Type: String, Default: cad-demo, AllowedPattern: '[a-z][a-z0-9-]{2,25}'}
+  VpcId: {Type: 'AWS::EC2::VPC::Id'}
+  PrivateSubnetIds: {Type: 'List<AWS::EC2::Subnet::Id>'}
+  ApiImageUri: {Type: String}
+  SchedulerImageUri: {Type: String}
+  WorkerImageUri: {Type: String}
+  ArtifactBucketName: {Type: String}
+  DispatchCodeKey: {Type: String}
+  RecoveryCodeKey: {Type: String}
+  InstanceTypes: {Type: CommaDelimitedList, Default: 'c6i.large,c6a.large'}
+  MaxVcpus: {Type: Number, Default: 16, MinValue: 2, MaxValue: 128}
+  UseSpot: {Type: String, Default: 'false', AllowedValues: ['true', 'false']}
+  StandardCpuCredits: {Type: String, Default: 'false', AllowedValues: ['true', 'false'], Description: 'Set true when all Batch instance types support Standard burst credits'}
+  AllowedOrigins: {Type: String, Default: '', Description: 'Additional comma-separated exact origins for external clients'}
+  LogRetentionDays: {Type: Number, Default: 14, AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]}
+  TableName: {Type: String, Default: SimulationJobs}
+Conditions:
+  Spot: !Equals [!Ref UseSpot, 'true']
+  StandardCredits: !Equals [!Ref StandardCpuCredits, 'true']
+  CustomOrigins: !Not [!Equals [!Ref AllowedOrigins, '']]
+Resources:
+  Jobs:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: PK, AttributeType: S}, {AttributeName: SK, AttributeType: S}, {AttributeName: OpsPK, AttributeType: S}, {AttributeName: OpsSK, AttributeType: S}]
+      KeySchema: [{AttributeName: PK, KeyType: HASH}, {AttributeName: SK, KeyType: RANGE}]
+      GlobalSecondaryIndexes:
+        - IndexName: Operational
+          KeySchema: [{AttributeName: OpsPK, KeyType: HASH}, {AttributeName: OpsSK, KeyType: RANGE}]
+          Projection: {ProjectionType: ALL}
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+  InputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules: [{Id: IncompleteUploads, Status: Enabled, AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}, NoncurrentVersionExpiration: {NoncurrentDays: 7}}]
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: !If [CustomOrigins, !Split [',', !Sub '${HttpApi.ApiEndpoint},${AllowedOrigins}'], [!GetAtt HttpApi.ApiEndpoint]]
+            AllowedMethods: [PUT, POST, GET, HEAD]
+            AllowedHeaders: ['content-type', 'content-length', 'x-amz-*']
+            ExposedHeaders: [ETag]
+            MaxAge: 300
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      VersioningConfiguration: {Status: Enabled}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: !If [CustomOrigins, !Split [',', !Sub '${HttpApi.ApiEndpoint},${AllowedOrigins}'], [!GetAtt HttpApi.ApiEndpoint]]
+            AllowedMethods: [GET, HEAD]
+            AllowedHeaders: ['range', 'content-type']
+            ExposedHeaders: [ETag, Content-Length, Content-Range]
+            MaxAge: 300
+  InputPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Deny, Principal: '*', Action: 's3:*', Resource: [!GetAtt InputBucket.Arn, !Sub '${InputBucket.Arn}/*'], Condition: {Bool: {'aws:SecureTransport': false}}}
+          - {Effect: Deny, Principal: '*', Action: 's3:*', Resource: !Sub '${InputBucket.Arn}/*', Condition: {NumericGreaterThan: {'s3:signatureAge': 600000}}}
+  OutputPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OutputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Deny, Principal: '*', Action: 's3:*', Resource: [!GetAtt OutputBucket.Arn, !Sub '${OutputBucket.Arn}/*'], Condition: {Bool: {'aws:SecureTransport': false}}}
+          - {Effect: Deny, Principal: '*', Action: 's3:GetObject', Resource: !Sub '${OutputBucket.Arn}/*', Condition: {NumericGreaterThan: {'s3:signatureAge': 600000}}}
+  DispatchDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+  DispatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      ReceiveMessageWaitTimeSeconds: 20
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt DispatchDlq.Arn, maxReceiveCount: 8}
+  EventDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+  StreamDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+  ApiLog:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/${EnvironmentName}/api', RetentionInDays: !Ref LogRetentionDays}
+  SchedulerLog:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/${EnvironmentName}/scheduler', RetentionInDays: !Ref LogRetentionDays}
+  WorkerLog:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/${EnvironmentName}/worker', RetentionInDays: !Ref LogRetentionDays}
+  ApiAccessLog:
+    Type: AWS::Logs::LogGroup
+    Properties: {RetentionInDays: !Ref LogRetentionDays}
+  DispatchLog:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-dispatch', RetentionInDays: !Ref LogRetentionDays}
+  RecoveryLog:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-recovery', RetentionInDays: !Ref LogRetentionDays}
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy']
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: JobApi
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:ConditionCheckItem', 'dynamodb:Query'], Resource: !GetAtt Jobs.Arn}
+              - {Effect: Allow, Action: ['s3:PutObject', 's3:GetObject', 's3:GetObjectVersion', 's3:AbortMultipartUpload'], Resource: !Sub '${InputBucket.Arn}/inputs/*'}
+              - {Effect: Allow, Action: ['s3:GetObject'], Resource: !Sub '${OutputBucket.Arn}/results/*'}
+              - {Effect: Allow, Action: ['batch:TerminateJob'], Resource: !Sub 'arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job/*'}
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: Placement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:ConditionCheckItem'], Resource: !GetAtt Jobs.Arn}
+              - {Effect: Allow, Action: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:ChangeMessageVisibility', 'sqs:GetQueueAttributes'], Resource: !GetAtt DispatchQueue.Arn}
+              - {Effect: Allow, Action: ['batch:SubmitJob'], Resource: [!Ref CpuQueue, !Ref WorkerDefinition]}
+              - {Effect: Allow, Action: ['batch:ListJobs', 'batch:DescribeJobs'], Resource: '*'}
+              - {Effect: Allow, Action: ['batch:TerminateJob'], Resource: !Sub 'arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job/*'}
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: ConversionWorker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:ConditionCheckItem'], Resource: !GetAtt Jobs.Arn}
+              - {Effect: Allow, Action: ['s3:GetObject', 's3:GetObjectVersion'], Resource: !Sub '${InputBucket.Arn}/inputs/*'}
+              - {Effect: Allow, Action: ['s3:PutObject', 's3:GetObject'], Resource: !Sub '${OutputBucket.Arn}/results/*'}
+  DispatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: StreamToQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['dynamodb:DescribeStream', 'dynamodb:GetRecords', 'dynamodb:GetShardIterator'], Resource: !GetAtt Jobs.StreamArn}
+              - {Effect: Allow, Action: ['dynamodb:ListStreams'], Resource: '*'}
+              - {Effect: Allow, Action: ['sqs:SendMessage'], Resource: [!GetAtt DispatchQueue.Arn, !GetAtt StreamDlq.Arn]}
+              - {Effect: Allow, Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: !GetAtt DispatchLog.Arn}
+  RecoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: Recovery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:ConditionCheckItem', 'dynamodb:Query'], Resource: [!GetAtt Jobs.Arn, !Sub '${Jobs.Arn}/index/Operational']}
+              - {Effect: Allow, Action: ['s3:GetObject'], Resource: !Sub '${OutputBucket.Arn}/results/*'}
+              - {Effect: Allow, Action: ['s3:AbortMultipartUpload'], Resource: !Sub '${InputBucket.Arn}/inputs/*'}
+              - {Effect: Allow, Action: ['batch:ListJobs', 'batch:DescribeJobs'], Resource: '*'}
+              - {Effect: Allow, Action: ['batch:TerminateJob'], Resource: !Sub 'arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job/*'}
+              - {Effect: Allow, Action: ['sqs:SendMessage'], Resource: [!GetAtt DispatchQueue.Arn, !GetAtt EventDlq.Arn]}
+              - {Effect: Allow, Action: ['logs:CreateLogStream', 'logs:PutLogEvents'], Resource: !GetAtt RecoveryLog.Arn}
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: batch.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBatchServiceRole']
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role']
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref InstanceRole]}
+  SpotRole:
+    Type: AWS::IAM::Role
+    Condition: Spot
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: spotfleet.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole']
+  VpcLinkSecurity:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API Gateway VPC Link egress to internal ALB
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: [{IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 10.42.0.0/16}]
+  AlbSecurity:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Only API Gateway VPC Link may reach the ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref VpcLinkSecurity}]
+      SecurityGroupEgress: [{IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 10.42.0.0/16}]
+  ApiSecurity:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Only internal ALB may reach API tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurity}]
+      SecurityGroupEgress: [{IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}]
+  ComputeSecurity:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Scheduler and CPU workers have HTTPS egress and no inbound access
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: [{IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}]
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        CreditSpecification: !If [StandardCredits, {CpuCredits: standard}, !Ref 'AWS::NoValue']
+        MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 2}
+        BlockDeviceMappings: [{DeviceName: /dev/xvda, Ebs: {VolumeSize: 60, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}}]
+  CpuEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeEnvironmentName: !Sub '${EnvironmentName}-cpu'
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: !If [Spot, SPOT, EC2]
+        AllocationStrategy: !If [Spot, SPOT_PRICE_CAPACITY_OPTIMIZED, BEST_FIT_PROGRESSIVE]
+        MinvCpus: 0
+        MaxvCpus: !Ref MaxVcpus
+        InstanceTypes: !Ref InstanceTypes
+        InstanceRole: !GetAtt InstanceProfile.Arn
+        Subnets: !Ref PrivateSubnetIds
+        SecurityGroupIds: [!Ref ComputeSecurity]
+        SpotIamFleetRole: !If [Spot, !GetAtt SpotRole.Arn, !Ref 'AWS::NoValue']
+        LaunchTemplate: {LaunchTemplateId: !Ref WorkerLaunchTemplate, Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber}
+        Ec2Configuration: [{ImageType: ECS_AL2023}]
+  CpuQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder: [{Order: 1, ComputeEnvironment: !Ref CpuEnvironment}]
+  WorkerDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      PlatformCapabilities: [EC2]
+      RetryStrategy: {Attempts: 1}
+      Timeout: {AttemptDurationSeconds: 2100}
+      ContainerProperties:
+        Image: !Ref WorkerImageUri
+        JobRoleArn: !GetAtt WorkerRole.Arn
+        ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+        ResourceRequirements: [{Type: VCPU, Value: '2'}, {Type: MEMORY, Value: '3072'}]
+        ReadonlyRootFilesystem: false
+        Privileged: false
+        User: '1654'
+        Environment:
+          - {Name: Platform__Mode, Value: Aws}
+          - {Name: Platform__Table, Value: !Ref Jobs}
+          - {Name: Platform__InputBucket, Value: !Ref InputBucket}
+          - {Name: Platform__OutputBucket, Value: !Ref OutputBucket}
+          - {Name: Platform__BatchQueue, Value: !Ref CpuQueue}
+          - {Name: Platform__ConverterPath, Value: /usr/local/bin/step-to-glb}
+          - {Name: AWS_REGION, Value: !Ref 'AWS::Region'}
+        LogConfiguration:
+          LogDriver: awslogs
+          Options: {awslogs-group: !Ref WorkerLog, awslogs-region: !Ref 'AWS::Region', awslogs-stream-prefix: conversion}
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties: {ClusterSettings: [{Name: containerInsights, Value: disabled}]}
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: {Scheme: internal, Type: application, Subnets: !Ref PrivateSubnetIds, SecurityGroups: [!Ref AlbSecurity]}
+  ApiTarget:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      Matcher: {HttpCode: '200'}
+      TargetGroupAttributes: [{Key: deregistration_delay.timeout_seconds, Value: '15'}]
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties: {LoadBalancerArn: !Ref LoadBalancer, Port: 80, Protocol: HTTP, DefaultActions: [{Type: forward, TargetGroupArn: !Ref ApiTarget}]}
+  ApiTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-api'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ApiRole.Arn
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref ApiImageUri
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings: [{ContainerPort: 8080, Protocol: tcp}]
+          Environment:
+            - {Name: ASPNETCORE_URLS, Value: 'http://+:8080'}
+            - {Name: DOTNET_ENVIRONMENT, Value: Production}
+            - {Name: Platform__Mode, Value: Aws}
+            - {Name: Platform__Table, Value: !Ref Jobs}
+            - {Name: Platform__InputBucket, Value: !Ref InputBucket}
+            - {Name: Platform__OutputBucket, Value: !Ref OutputBucket}
+            - {Name: Platform__BatchQueue, Value: !Ref CpuQueue}
+            - {Name: Auth__Authority, Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'}
+            - {Name: Auth__Audience, Value: !Ref UserPoolClient}
+            - {Name: Auth__Domain, Value: !Sub 'https://${EnvironmentName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'}
+            - {Name: AllowedOrigins, Value: !If [CustomOrigins, !Ref AllowedOrigins, !GetAtt HttpApi.ApiEndpoint]}
+            - {Name: AWS_REGION, Value: !Ref 'AWS::Region'}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: {awslogs-group: !Ref ApiLog, awslogs-region: !Ref 'AWS::Region', awslogs-stream-prefix: api}
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref ApiTask
+      LaunchType: FARGATE
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration: {DeploymentCircuitBreaker: {Enable: true, Rollback: true}}
+      NetworkConfiguration: {AwsvpcConfiguration: {AssignPublicIp: DISABLED, Subnets: !Ref PrivateSubnetIds, SecurityGroups: [!Ref ApiSecurity]}}
+      LoadBalancers: [{ContainerName: api, ContainerPort: 8080, TargetGroupArn: !Ref ApiTarget}]
+  SchedulerTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-scheduler'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt SchedulerRole.Arn
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ContainerDefinitions:
+        - Name: scheduler
+          Image: !Ref SchedulerImageUri
+          Essential: true
+          ReadonlyRootFilesystem: true
+          Environment:
+            - {Name: DOTNET_ENVIRONMENT, Value: Production}
+            - {Name: Platform__Mode, Value: Aws}
+            - {Name: Platform__Table, Value: !Ref Jobs}
+            - {Name: Platform__InputBucket, Value: !Ref InputBucket}
+            - {Name: Platform__OutputBucket, Value: !Ref OutputBucket}
+            - {Name: Platform__QueueUrl, Value: !Ref DispatchQueue}
+            - {Name: Platform__BatchQueue, Value: !Ref CpuQueue}
+            - {Name: Platform__BatchDefinition, Value: !Ref WorkerDefinition}
+            - {Name: AWS_REGION, Value: !Ref 'AWS::Region'}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: {awslogs-group: !Ref SchedulerLog, awslogs-region: !Ref 'AWS::Region', awslogs-stream-prefix: scheduler}
+  SchedulerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref SchedulerTask
+      LaunchType: FARGATE
+      DesiredCount: 1
+      DeploymentConfiguration: {DeploymentCircuitBreaker: {Enable: true, Rollback: true}}
+      NetworkConfiguration: {AwsvpcConfiguration: {AssignPublicIp: DISABLED, Subnets: !Ref PrivateSubnetIds, SecurityGroups: [!Ref ComputeSecurity]}}
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${EnvironmentName}-jobs'
+      ProtocolType: HTTP
+      CorsConfiguration: !If
+        - CustomOrigins
+        - AllowOrigins: !Split [',', !Ref AllowedOrigins]
+          AllowMethods: [GET, POST, OPTIONS]
+          AllowHeaders: [Authorization, Content-Type]
+          MaxAge: 300
+        - !Ref 'AWS::NoValue'
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties: {Name: !Sub '${EnvironmentName}-link', SubnetIds: !Ref PrivateSubnetIds, SecurityGroupIds: [!Ref VpcLinkSecurity]}
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref Listener
+      IntegrationMethod: ANY
+      PayloadFormatVersion: '1.0'
+      RequestParameters: {'overwrite:path': '$request.path'}
+  Authorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      IdentitySource: ['$request.header.Authorization']
+      Name: CognitoTenant
+      JwtConfiguration: {Audience: [!Ref UserPoolClient], Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'}
+  JobRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref HttpApi, RouteKey: 'ANY /api/jobs', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref Authorizer}
+  NestedJobRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref HttpApi, RouteKey: 'ANY /api/jobs/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: JWT, AuthorizerId: !Ref Authorizer}
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref HttpApi, RouteKey: 'GET /health', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE}
+  FrontendRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref HttpApi, RouteKey: 'GET /', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE}
+  FrontendConfigRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref HttpApi, RouteKey: 'GET /config.json', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE}
+  FrontendAssetsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref HttpApi, RouteKey: 'GET /assets/{proxy+}', Target: !Sub 'integrations/${Integration}', AuthorizationType: NONE}
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings: {ThrottlingBurstLimit: 100, ThrottlingRateLimit: 50}
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLog.Arn
+        Format: '{"requestId":"$context.requestId","status":"$context.status","routeKey":"$context.routeKey","latency":"$context.responseLatency"}'
+  DispatchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-dispatch'
+      Runtime: dotnet10
+      Handler: DispatchLambda::StepGlb.DispatchLambda.Function::Handler
+      Architectures: [x86_64]
+      Role: !GetAtt DispatchRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code: {S3Bucket: !Ref ArtifactBucketName, S3Key: !Ref DispatchCodeKey}
+      Environment: {Variables: {Platform__QueueUrl: !Ref DispatchQueue}}
+  StreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt Jobs.StreamArn
+      FunctionName: !Ref DispatchFunction
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 50
+      MaximumRetryAttempts: 5
+      MaximumRecordAgeInSeconds: 3600
+      BisectBatchOnFunctionError: true
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      DestinationConfig: {OnFailure: {Destination: !GetAtt StreamDlq.Arn}}
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"dynamodb":{"NewImage":{"status":{"S":["READY"]},"SK":{"S":[{"prefix":"JOB#"}]}}}}'
+  RecoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-recovery'
+      Runtime: dotnet10
+      Handler: StateRecoveryLambda::StepGlb.StateRecoveryLambda.Function::Handler
+      Architectures: [x86_64]
+      Role: !GetAtt RecoveryRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code: {S3Bucket: !Ref ArtifactBucketName, S3Key: !Ref RecoveryCodeKey}
+      Environment:
+        Variables:
+          Platform__Mode: Aws
+          Platform__Table: !Ref Jobs
+          Platform__InputBucket: !Ref InputBucket
+          Platform__OutputBucket: !Ref OutputBucket
+          Platform__BatchQueue: !Ref CpuQueue
+          Platform__QueueUrl: !Ref DispatchQueue
+  RecoveryAsync:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties: {FunctionName: !Ref RecoveryFunction, Qualifier: '$LATEST', MaximumRetryAttempts: 2, MaximumEventAgeInSeconds: 3600, DestinationConfig: {OnFailure: {Destination: !GetAtt EventDlq.Arn}}}
+  BatchEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern: {source: [aws.batch], detail-type: [Batch Job State Change], detail: {jobQueue: [!Ref CpuQueue]}}
+      State: ENABLED
+      Targets: [{Id: recovery, Arn: !GetAtt RecoveryFunction.Arn, DeadLetterConfig: {Arn: !GetAtt EventDlq.Arn}, RetryPolicy: {MaximumRetryAttempts: 10, MaximumEventAgeInSeconds: 3600}}]
+  BatchInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: 'lambda:InvokeFunction', FunctionName: !Ref RecoveryFunction, Principal: events.amazonaws.com, SourceArn: !GetAtt BatchEvents.Arn}
+  EventDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventDlq]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: events.amazonaws.com}, Action: 'sqs:SendMessage', Resource: !GetAtt EventDlq.Arn, Condition: {ArnEquals: {'aws:SourceArn': !GetAtt BatchEvents.Arn}}}]
+  ReconcileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: scheduler.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: InvokeRecovery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: 'lambda:InvokeFunction', Resource: !GetAtt RecoveryFunction.Arn}
+              - {Effect: Allow, Action: 'sqs:SendMessage', Resource: !GetAtt EventDlq.Arn}
+  ReconcileSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      ScheduleExpression: rate(2 minutes)
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      State: ENABLED
+      Target:
+        Arn: !GetAtt RecoveryFunction.Arn
+        RoleArn: !GetAtt ReconcileRole.Arn
+        Input: '{"reconcile":true}'
+        DeadLetterConfig: {Arn: !GetAtt EventDlq.Arn}
+        RetryPolicy: {MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 600}
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub '${EnvironmentName}-users'
+      AdminCreateUserConfig: {AllowAdminCreateUserOnly: true}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: 'OFF'
+      Policies: {PasswordPolicy: {MinimumLength: 14, RequireLowercase: true, RequireNumbers: true, RequireSymbols: true, RequireUppercase: true}}
+      Schema: [{Name: tenantId, AttributeDataType: String, Mutable: false, Required: false, StringAttributeConstraints: {MinLength: '1', MaxLength: '128'}}]
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties: {Domain: !Sub '${EnvironmentName}-${AWS::AccountId}', UserPoolId: !Ref UserPool}
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid]
+      CallbackURLs: [!Sub '${HttpApi.ApiEndpoint}/']
+      LogoutURLs: [!Sub '${HttpApi.ApiEndpoint}/']
+      ReadAttributes: [email, 'custom:tenantId']
+      WriteAttributes: [email]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      IdTokenValidity: 15
+      AccessTokenValidity: 15
+      RefreshTokenValidity: 1
+      TokenValidityUnits: {IdToken: minutes, AccessToken: minutes, RefreshToken: days}
+  DispatchDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Dispatch messages exhausted retries; investigate and redrive after correction
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt DispatchDlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  EventDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Batch events or reconciliation delivery failed
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt EventDlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Dispatch backlog exceeds five minutes
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{Name: QueueName, Value: !GetAtt DispatchQueue.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  RecoveryErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref RecoveryFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  StreamDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: DynamoDB stream dispatch batches exhausted retries
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt StreamDlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  ApiUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Internal ALB reports unhealthy API targets
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - {Name: TargetGroup, Value: !GetAtt ApiTarget.TargetGroupFullName}
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+Outputs:
+  ApiUrl: {Value: !GetAtt HttpApi.ApiEndpoint}
+  FrontendUrl: {Value: !GetAtt HttpApi.ApiEndpoint}
+  InputBucketName: {Value: !Ref InputBucket}
+  OutputBucketName: {Value: !Ref OutputBucket}
+  DynamoDbTableName: {Value: !Ref Jobs}
+  BatchJobQueueArn: {Value: !Ref CpuQueue}
+  UserPoolId: {Value: !Ref UserPool}
+  UserPoolClientId: {Value: !Ref UserPoolClient}
+  AuthDomain: {Value: !Sub 'https://${EnvironmentName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'}
+  DispatchQueueUrl: {Value: !Ref DispatchQueue}
+  DispatchDlqUrl: {Value: !Ref DispatchDlq}

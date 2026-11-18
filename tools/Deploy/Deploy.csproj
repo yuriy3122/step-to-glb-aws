@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup><ItemGroup><PackageReference Include="AWSSDK.CloudFormation" Version="4.1.0"/><PackageReference Include="AWSSDK.ECR" Version="4.1.0"/><PackageReference Include="AWSSDK.S3" Version="4.1.0"/><PackageReference Include="AWSSDK.SecurityToken" Version="4.1.0"/></ItemGroup></Project>
